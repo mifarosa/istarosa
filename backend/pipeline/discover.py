@@ -197,6 +197,35 @@ DEEP_DATASETS = [
 ]
 
 
+METRO_API = "https://api.ibb.gov.tr/MetroIstanbul/api/MetroMobile/V2"
+# Places where the Metro Istanbul API might document its POST bodies.
+METRO_API_DOC_CANDIDATES = [
+    "https://api.ibb.gov.tr/MetroIstanbul/swagger/docs/v1",
+    "https://api.ibb.gov.tr/MetroIstanbul/swagger/index.html",
+    "https://api.ibb.gov.tr/MetroIstanbul/swagger/v1/swagger.json",
+    "https://api.ibb.gov.tr/MetroIstanbul/help",
+    "https://api.ibb.gov.tr/MetroIstanbul/Help/Api/POST-api-MetroMobile-V2-GetTimeTable",
+    "https://api.ibb.gov.tr/MetroIstanbul/Help/Api/POST-api-MetroMobile-V2-GetStationBetweenTime",
+]
+
+
+def probe_api(url: str, errors: list, limit: int = 1500) -> str | None:
+    """GET first; on 400/405/415 retry with an empty JSON POST. Error bodies are kept because
+    APIs often name the missing fields in a 400 response."""
+    def attempt(**kw) -> str:
+        try:
+            return "OK " + http(url, max_bytes=limit, timeout=30, **kw).decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            body = exc.read(limit).decode("utf-8", errors="replace")
+            return f"HTTP {exc.code}: {body}"
+    out = safe(f"probe {url}", lambda: attempt(), errors)
+    if out and out.startswith("HTTP") and out.split()[1].rstrip(":") in {"400", "405", "415"}:
+        post = safe(f"probe POST {url}", lambda: attempt(
+            data=b"{}", headers={"Content-Type": "application/json"}), errors)
+        out += "\n--- POST {} ---\n" + (post or "(failed)")
+    return out
+
+
 def deep_dive(errors: list) -> dict[str, dict]:
     """List resources of the deep datasets and probe API/GeoJSON endpoints (first bytes only)."""
     result: dict[str, dict] = {}
@@ -209,12 +238,19 @@ def deep_dive(errors: list) -> dict[str, dict]:
             fmt = (r.get("format") or "").lower()
             entry = {"name": r.get("name"), "format": fmt, "url": r.get("url"),
                      "description": (r.get("description") or "")[:300], "modified": r.get("last_modified")}
-            if fmt in {"api", "geojson", "json", "kml"} and r.get("url"):
-                raw = safe(f"probe {r['url']}", lambda u=r["url"]: http(u, max_bytes=1500, timeout=30), errors)
+            if fmt == "api" and r.get("url") and "/Help" not in r["url"]:
+                entry["probe"] = probe_api(r["url"], errors)
+            elif fmt in {"geojson", "json", "kml"} and r.get("url"):
+                raw = safe(f"probe {r['url']}", lambda u=r["url"]: http(u, max_bytes=4000, timeout=30), errors)
                 if raw:
                     entry["probe"] = raw.decode("utf-8", errors="replace")
             resources.append(entry)
         result[name] = {"title": pkg.get("title"), "notes": (pkg.get("notes") or "")[:500], "resources": resources}
+
+    docs = [{"name": u, "format": "api", "url": u, "description": "possible API documentation",
+             "probe": probe_api(u, errors, limit=2500)} for u in METRO_API_DOC_CANDIDATES]
+    result["_metro-api-doc-candidates"] = {"title": "Metro Istanbul API documentation candidates",
+                                           "notes": "", "resources": docs}
     return result
 
 
