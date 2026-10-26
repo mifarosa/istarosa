@@ -105,7 +105,9 @@ def sniff_table(raw: bytes) -> dict:
     except csv.Error:
         delim = ","
     rows = list(csv.reader(io.StringIO("\n".join(lines)), delimiter=delim))
-    return {"encoding": enc, "delimiter": delim, "columns": rows[0], "rows": rows[1:4]}
+    # raw bytes of the first lines: shows real encoding / number formatting problems
+    raw_head = [repr(b)[:240] for b in raw.splitlines()[:3]]
+    return {"encoding": enc, "delimiter": delim, "columns": rows[0], "rows": rows[1:4], "raw_head": raw_head}
 
 
 def safe(label: str, fn, errors: list):
@@ -134,32 +136,103 @@ def collect_datasets(errors: list) -> dict[str, dict]:
     return found
 
 
-def peek_resource(res: dict, max_bytes: int, errors: list) -> dict | None:
-    """Learn the schema of one resource: datastore first (cheap), file head otherwise."""
+def peek_datastore(res: dict, errors: list) -> dict | None:
     rid = res.get("id")
-    if res.get("datastore_active"):
-        ds = safe(f"datastore_search {rid}", lambda: ckan("datastore_search", resource_id=rid, limit=3), errors)
-        if ds:
-            return {
-                "via": "datastore",
-                "total": ds.get("total"),
-                "columns": [f["id"] for f in ds.get("fields", []) if f["id"] != "_id"],
-                "rows": [list(map(str, r.values())) for r in ds.get("records", [])],
-            }
+    if not res.get("datastore_active"):
+        return None
+    ds = safe(f"datastore_search {rid}", lambda: ckan("datastore_search", resource_id=rid, limit=3), errors)
+    if not ds:
+        return None
+    columns = [f["id"] for f in ds.get("fields", []) if f["id"] != "_id"]
+    return {
+        "via": "datastore",
+        "total": ds.get("total"),
+        "columns": columns,
+        # index by column name so the CKAN-internal _id never shifts the values
+        "rows": [[str(r.get(c)) for c in columns] for r in ds.get("records", [])],
+    }
+
+
+def peek_file(res: dict, max_bytes: int, errors: list) -> dict | None:
     url, fmt = res.get("url"), (res.get("format") or "").lower()
-    if url and fmt in TABULAR_FORMATS and fmt not in {"xlsx", "xls"}:
-        raw = safe(f"download head {url}", lambda: http(url, max_bytes=max_bytes, timeout=90), errors)
-        if raw:
-            info = sniff_table(raw)
-            info["via"] = f"file head ({len(raw)} bytes)"
-            return info
-    return None
+    if not url or fmt not in TABULAR_FORMATS - {"xlsx", "xls"}:
+        return None
+    raw = safe(f"download head {url}", lambda: http(url, max_bytes=max_bytes, timeout=90), errors)
+    if not raw:
+        return None
+    info = sniff_table(raw)
+    info["via"] = f"file head ({len(raw)} bytes)"
+    return info
+
+
+def peek_resource(res: dict, max_bytes: int, errors: list) -> dict[str, dict]:
+    """Learn the schema of one resource. The datastore copy and the raw file can differ
+    (encoding, number formatting, truncation), so GTFS files are peeked both ways."""
+    out = {}
+    ds = peek_datastore(res, errors)
+    if ds:
+        out["datastore"] = ds
+    if not ds or is_gtfs_resource(res):
+        fi = peek_file(res, max_bytes, errors)
+        if fi:
+            out["file"] = fi
+    return out
+
+
+# ---------------------------------------------------------------- deep dive
+# Datasets that may hold fresher metro / rail / ferry data than the stale GTFS feed.
+DEEP_DATASETS = [
+    "metro-istanbul-hat-bilgisi-listesi",
+    "metro-istanbul-istasyon-bilgi-listesi",
+    "metro-istanbul-hat-id-sine-gore-istasyon-bilgileri-listesi",
+    "metro-istanbul-hat-id-sine-gore-yon-bilgisi-listesi",
+    "metro-istanbul-istasyonlarin-baslangic-istasyonuna-olan-uzaklik-sureleri-listesi",
+    "metro-istanbul-sefer-tarifeleri-listesi-web-servisi",
+    "rayli-sistemlere-ait-aktarma-bilgileri",
+    "rayli-ulasim-hatlari-vektor-verisi",
+    "deniz-ulasim-hatlari-vektor-verisi",
+    "deniz-ulasim-istasyonlari-vektor-verisi",
+    "istanbul-sehir-hatlari-iskeleleri",
+    "sehir-hatlari-sefer-sayilari",
+]
+
+
+def deep_dive(errors: list) -> dict[str, dict]:
+    """List resources of the deep datasets and probe API/GeoJSON endpoints (first bytes only)."""
+    result: dict[str, dict] = {}
+    for name in DEEP_DATASETS:
+        pkg = safe(f"package_show {name}", lambda n=name: ckan("package_show", id=n), errors)
+        if not pkg:
+            continue
+        resources = []
+        for r in pkg.get("resources", []):
+            fmt = (r.get("format") or "").lower()
+            entry = {"name": r.get("name"), "format": fmt, "url": r.get("url"),
+                     "description": (r.get("description") or "")[:300], "modified": r.get("last_modified")}
+            if fmt in {"api", "geojson", "json", "kml"} and r.get("url"):
+                raw = safe(f"probe {r['url']}", lambda u=r["url"]: http(u, max_bytes=1500, timeout=30), errors)
+                if raw:
+                    entry["probe"] = raw.decode("utf-8", errors="replace")
+            resources.append(entry)
+        result[name] = {"title": pkg.get("title"), "notes": (pkg.get("notes") or "")[:500], "resources": resources}
+    return result
 
 
 # ---------------------------------------------------------------- Overpass
-def overpass(query: str) -> dict:
+OVERPASS_MIRRORS = [OVERPASS, "https://overpass.kumi.systems/api/interpreter"]
+
+
+def overpass(query: str, attempts: int = 4) -> dict:
+    """Public Overpass instances return 502/504 under load: retry with backoff, rotate mirrors."""
     data = urllib.parse.urlencode({"data": query}).encode()
-    return json.loads(http(OVERPASS, data=data, timeout=180).decode("utf-8"))
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return json.loads(http(OVERPASS_MIRRORS[i % len(OVERPASS_MIRRORS)], data=data, timeout=180).decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last = exc
+            time.sleep(5 * (i + 1))
+    raise last  # type: ignore[misc]
 
 
 def collect_osm(errors: list) -> dict:
@@ -191,7 +264,8 @@ def md_table(rows: list[list[str]], header: list[str]) -> str:
     return "\n".join(lines)
 
 
-def render_report(datasets: dict, peeks: dict, osm: dict | None, errors: list) -> str:
+def render_report(datasets: dict, peeks: dict, osm: dict | None, errors: list,
+                  deep: dict | None = None) -> str:
     out = [f"# istarosa data source discovery\n",
            f"Generated {datetime.now(timezone.utc).isoformat(timespec='seconds')} by `backend/pipeline/discover.py`.\n"]
 
@@ -224,6 +298,19 @@ def render_report(datasets: dict, peeks: dict, osm: dict | None, errors: list) -
         out.append(f"- columns: `{', '.join(info.get('columns', []))}`")
         for row in info.get("rows", []):
             out.append(f"  - `{row}`")
+        for line in info.get("raw_head", []):
+            out.append(f"  - raw: `{line}`")
+
+    if deep:
+        out.append("\n## Deep dive: metro / rail / ferry datasets\n")
+        for name, d in deep.items():
+            out.append(f"\n### {name}\n\n{d.get('title')}: {(d.get('notes') or '').strip()[:300]}\n")
+            for r in d["resources"]:
+                out.append(f"- **{r['name']}** ({r['format']}, {str(r.get('modified') or '')[:10]}) {r['url']}")
+                if r.get("description"):
+                    out.append(f"  - {r['description']}")
+                if r.get("probe"):
+                    out.append("  - probe (first bytes):\n\n```\n" + r["probe"][:700] + "\n```")
 
     out.append("\n## Other candidate datasets (not in the GTFS pair)\n")
     others = [(n, p) for n, p in sorted(datasets.items()) if n not in KNOWN_DATASETS]
@@ -253,6 +340,8 @@ def main(argv=None) -> int:
     ap.add_argument("--report", type=Path, default=Path("docs/data-sources.md"), help="Markdown report path")
     ap.add_argument("--max-bytes", type=int, default=64 * 1024, help="bytes to download per file when peeking")
     ap.add_argument("--skip-overpass", action="store_true")
+    ap.add_argument("--skip-deep", action="store_true",
+                    help="skip the metro/rail/ferry dataset deep dive")
     args = ap.parse_args(argv)
 
     errors: list[str] = []
@@ -266,10 +355,15 @@ def main(argv=None) -> int:
     peeks: dict[str, dict] = {}
     for name in KNOWN_DATASETS:
         for res in datasets.get(name, {}).get("resources", []):
-            info = peek_resource(res, args.max_bytes, errors)
-            if info:
-                peeks[f"{name} / {res.get('name') or res.get('id')}"] = info
+            for kind, info in peek_resource(res, args.max_bytes, errors).items():
+                peeks[f"{name} / {res.get('name') or res.get('id')} [{kind}]"] = info
     (args.out / "schemas.json").write_text(json.dumps(peeks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    deep = None
+    if not args.skip_deep:
+        print("[2b/3] deep dive: metro / rail / ferry datasets")
+        deep = deep_dive(errors)
+        (args.out / "deep.json").write_text(json.dumps(deep, ensure_ascii=False, indent=2), encoding="utf-8")
 
     osm = None
     if not args.skip_overpass:
@@ -278,7 +372,7 @@ def main(argv=None) -> int:
         (args.out / "osm.json").write_text(json.dumps(osm, ensure_ascii=False, indent=2), encoding="utf-8")
 
     args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(render_report(datasets, peeks, osm, errors), encoding="utf-8")
+    args.report.write_text(render_report(datasets, peeks, osm, errors, deep), encoding="utf-8")
     print(f"done: report -> {args.report}, raw -> {args.out}/ ({len(errors)} errors)")
     return 0 if datasets else 1
 

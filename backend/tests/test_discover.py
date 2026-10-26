@@ -28,3 +28,17 @@ def test_sniff_table_strips_bom():
 def test_render_report_with_no_data_does_not_crash():
     text = discover.render_report({}, {}, None, ["boom"])
     assert "boom" in text
+
+
+def test_peek_datastore_rows_follow_columns_not_internal_id(monkeypatch):
+    fake = {"total": 2, "fields": [{"id": "_id"}, {"id": "stop_id"}, {"id": "stop_name"}],
+            "records": [{"_id": 1, "stop_id": "10", "stop_name": "A"}]}
+    monkeypatch.setattr(discover, "ckan", lambda *a, **k: fake)
+    info = discover.peek_datastore({"id": "x", "datastore_active": True}, [])
+    assert info["columns"] == ["stop_id", "stop_name"]
+    assert info["rows"] == [["10", "A"]]
+
+
+def test_sniff_table_keeps_raw_head():
+    info = discover.sniff_table(b"a,b\n410.191.700.005.564,2\n")
+    assert "410.191.700.005.564" in info["raw_head"][1]
